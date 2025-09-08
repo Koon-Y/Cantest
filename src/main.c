@@ -357,63 +357,81 @@ can_frame_t can_frame = {
 // 處理USART命令的函數
 void process_usart_command(char *cmd)
 {
-    int data_index;
-    int hex_value;
-    
-    // 解析命令格式: "index value"
-    // 例如: "0 60" 或 "1 EE"
-    if (sscanf(cmd, "%d %x", &data_index, &hex_value) == 2)
+    // 去掉頭尾空白與換行
+    while (*cmd == ' ' || *cmd == '\t') cmd++; // 去掉前面空白
+    int len = strlen(cmd);
+    while (len > 0 && (cmd[len-1] == '\r' || cmd[len-1] == '\n' || cmd[len-1] == ' ' || cmd[len-1] == '\t')) {
+        cmd[--len] = '\0';
+    }
+
+    if (len == 0) {
+        // 空字串，直接跳過
+        return;
+    }
+
+    // 解析 DLC + data 的格式，例如: "3 02 FF GG"
+    int dlc = 0;
+    uint8_t data[8] = {0};
+    char *ptr = cmd;
+    if (sscanf(ptr, "%d", &dlc) == 1 && dlc > 0 && dlc <= 8)
     {
-        // 檢查索引是否有效
-        if (data_index >= 0 && data_index < 8)
+        ptr = strchr(cmd, ' '); // 找到第一個空格
+        if (ptr)
         {
-            // 檢查值是否有效 (0-255)
-            if (hex_value >= 0 && hex_value <= 255)
+            ptr++; // 指向第一個資料
+            int i;
+            for (i = 0; i < dlc; i++)
             {
-                can_frame.data[data_index] = (uint8_t)hex_value;
-                printf("設定 data[%d] = 0x%02X\n", data_index, hex_value);
-                
-                // 發送CAN訊息
-                mcp2515_send_can_frame(&can_frame);
+                int val;
+                if (sscanf(ptr, "%x", &val) == 1)
+                {
+                    data[i] = (uint8_t)val;
+                    ptr = strchr(ptr, ' ');
+                    if (!ptr && i != dlc-1) {
+                        printf("資料不足，剩餘使用0填充\n");
+                        break;
+                    }
+                    if (ptr) ptr++;
+                }
+                else
+                {
+                    printf("資料格式錯誤，停止解析\n");
+                    break;
+                }
             }
-            else
-            {
-                printf("錯誤: 數值必須在 0-FF 範圍內\n");
-            }
-        }
-        else
-        {
-            printf("錯誤: 索引必須在 0-7 範圍內\n");
+            can_frame.can_dlc = dlc;
+            memcpy(can_frame.data, data, 8);
+            mcp2515_send_can_frame(&can_frame);
+            return;
         }
     }
-    else if (strcmp(cmd, "send") == 0)
+
+    // 處理原有命令
+    if (strcmp(cmd, "send") == 0)
     {
-        // 直接發送當前的CAN框架
         printf("發送當前CAN框架:\n");
         mcp2515_send_can_frame(&can_frame);
     }
     else if (strcmp(cmd, "show") == 0)
     {
-        // 顯示當前CAN框架內容
         printf("當前CAN框架內容:\n");
         mcp2515_print_can_frame(&can_frame);
     }
     else if (strcmp(cmd, "help") == 0)
     {
         printf("可用命令:\n");
-        printf("  <index> <value> - 設定並發送 data[index] = value (十六進位)\n");
-        printf("  send            - 發送當前CAN框架\n");
-        printf("  show            - 顯示當前CAN框架\n");
-        printf("  help            - 顯示此幫助訊息\n");
+        printf("  <dlc> <data0> <data1> ... - 傳送CAN frame\n");
+        printf("  send                      - 發送當前CAN框架\n");
+        printf("  show                      - 顯示當前CAN框架\n");
+        printf("  help                      - 顯示幫助訊息\n");
         printf("範例:\n");
-        printf("  0 60    - 設定 data[0] = 0x60 並發送\n");
-        printf("  1 EE    - 設定 data[1] = 0xEE 並發送\n");
+        printf("  3 02 FF 10    - 傳送 DLC=3, data={0x02,0xFF,0x10}\n");
     }
-    // else
-    // {
-    //     printf("未知命令: %s\n", cmd);
-    //     printf("輸入 'help' 查看可用命令\n");
-    // }
+    else
+    {
+        printf("未知命令: %s\n", cmd);
+        printf("輸入 'help' 查看可用命令\n");
+    }
 }
 
 int main(void)
@@ -496,60 +514,53 @@ void usart2_isr(void)
 
 void exti9_5_isr(void)
 {
-    printf("irq:%d\n", mcp2515_getInterrupts(&mcp2515));
+  printf("========接收========\n");
+    uint8_t intf = mcp2515_getInterrupts(&mcp2515);
+    printf("Irq 觸發: ");
+    bool printed = false;
 
-    // CANINTF bit6，當從sleepmode啟動時
-    // 甚至沒有出現在driver裡面，也不確定為何會發生
-    if (mcp2515_getInterrupts(&mcp2515) & CANINTF_WAKIF)
+    if (intf & CANINTF_MERRF)   { printf("MERRF "); printed = true; mcp2515_clearMERR_Interrupt(&mcp2515); }
+    if (intf & CANINTF_RX1IF)   { printf("RX1IF "); printed = true; }
+    if (intf & CANINTF_ERRIF)   { printf("ERRIF "); printed = true; 
+                                   uint8_t err_flag = mcp2515_getErrorFlags(&mcp2515);
+                                   mcp2515_error_dealing(err_flag, &mcp2515);
+                                   mcp2515_clearERRIF_Interrupt(&mcp2515); }
+    if (intf & CANINTF_TX2IF)   { printf("TX2IF "); printed = true; mcp2515_clearTX2_Interrupts(&mcp2515); }
+    if (intf & CANINTF_TX1IF)   { printf("TX1IF "); printed = true; mcp2515_clearTX1_Interrupts(&mcp2515); }
+    if (intf & CANINTF_TX0IF)   { printf("TX0IF "); printed = true; mcp2515_clearTX0_Interrupts(&mcp2515); }
+    if (intf & CANINTF_RX0IF)   { printf("RX0IF "); printed = true; }
+    if (intf & CANINTF_WAKIF)   { printf("WAKIF "); printed = true; mcp2515_clearWAKIF_Interrupt(&mcp2515); }
+
+    if (!printed) printf("無觸發");
+    printf("\n");
+
+    // 處理 RX 緩衝區
+    while (intf & (CANINTF_RX0IF | CANINTF_RX1IF))
     {
-      mcp2515_clearWAKIF_Interrupt(&mcp2515);
-      printf("清除WAKIF");
-    }
+        ERROR ERR_msg = mcp2515_readMessage(&mcp2515, &rx_frame);
 
-    // 偵測ERRIF(CANINTF bit5)是否為1
-    if (mcp2515_getInterrupts(&mcp2515) & CANINTF_ERRIF)
-    {
-      uint8_t err_flag = mcp2515_getErrorFlags(&mcp2515);
-      mcp2515_error_dealing(err_flag, &mcp2515);  // 處理MCP_EFLG暫存器的中斷
-      mcp2515_clearERRIF_Interrupt(&mcp2515);     // 處理CANINTF bit5的ERROR中斷
-    }
-
-    // 偵測MERRF(CANINTF bit7)是否為1，當傳送發生問題時會發生
-    if (mcp2515_getInterrupts(&mcp2515) & CANINTF_MERRF)
-    {
-      mcp2515_clearMERR_Interrupt(&mcp2515);
-    }
-
-    while ((mcp2515_getInterrupts(&mcp2515) & CANINTF_RX0IF) || (mcp2515_getInterrupts(&mcp2515) & CANINTF_RX1IF))
-    {
-      ERROR ERR_msg = mcp2515_readMessage(&mcp2515, &rx_frame);  // 只會輸出ERROR_OK、ERROR_FAILED、ERROR_NOMSG
-
-      if (ERR_msg == ERROR_OK)
-      {
-        if (rx_frame.can_id == CanID)
+        if (ERR_msg == ERROR_OK && rx_frame.can_id == CanID)
         {
-        //   irq_frame_handle = true;
-          printf("MCP接收");
-          mcp2515_print_can_frame(&rx_frame);
-          mcp2515_decode_package(&rx_frame);
+            printf("MCP接收");
+            mcp2515_print_can_frame(&rx_frame);
+            mcp2515_decode_package(&rx_frame);
         }
-      }
-      else
-      {
-        printf("RX失敗irq: %d\n", mcp2515_getInterrupts(&mcp2515));
-        // mcp2515_Show_error_msg(ERR_msg);
-      }
-      if (mcp2515_getInterrupts(&mcp2515) & CANINTF_RX0IF)
-      {
-        mcp2515_clearRX0IF_Interrupt(&mcp2515);  // 清除RX0中斷
-      }
-      else
-      {
-        mcp2515_clearRX1IF_Interrupt(&mcp2515);  // 清除RX1中斷
-      }
-      mcp2515_check_after_rx_tx(&mcp2515);
+        else if (ERR_msg != ERROR_OK)
+        {
+            printf("RX失敗 irq flags: 0x%02X\n", intf);
+        }
+
+        // 清除對應的 RX 中斷
+        intf = mcp2515_getInterrupts(&mcp2515);
+        if (intf & CANINTF_RX0IF) mcp2515_clearRX0IF_Interrupt(&mcp2515);
+        if (intf & CANINTF_RX1IF) mcp2515_clearRX1IF_Interrupt(&mcp2515);
+
+        mcp2515_check_after_rx_tx(&mcp2515);
+        intf = mcp2515_getInterrupts(&mcp2515);
     }
+
     exti_reset_request(INT_EXTI);
+    printf("========結束========\n");
 }
 
 void mcp2515_send_can_frame(can_frame_t *can_frame)
